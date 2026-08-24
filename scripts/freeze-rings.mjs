@@ -28,15 +28,60 @@ const server = new rpc.Server(RPC);
 const toNative = (v) => scValToNative(typeof v === 'string' ? xdr.ScVal.fromXDR(v, 'base64') : v);
 
 /** Canonical tested version lives in @passport/shared (detectReciprocalRings). */
-function detectReciprocalRings(pairs) {
-  const edges = new Set(pairs.map((p) => `${p.from}>${p.claimer}`));
-  const flagged = new Set();
+/**
+ * Detects abuse patterns in the vouch event graph:
+ * - Reciprocal rings (A?B)
+ * - Short cycles (A?B?C?A)
+ * - Dense clusters (high in/out degree)
+ * 
+ * Thresholds:
+ * - Short cycles of length 2 and 3 are flagged.
+ * - Dense clusters: in/out degree >= 5.
+ * 
+ * False-positive handling:
+ * - Strict thresholds to avoid catching organic communities.
+ * - Always review in dry-run mode before applying.
+ */
+function detectAbuse(pairs) {
+  const edges = new Set(pairs.map((p) => `>`));
+  const adj = {};
+  const inDegree = {};
+  const outDegree = {};
+
   for (const p of pairs) {
-    if (edges.has(`${p.claimer}>${p.from}`)) {
+    if (!adj[p.from]) adj[p.from] = [];
+    adj[p.from].push(p.claimer);
+    outDegree[p.from] = (outDegree[p.from] || 0) + 1;
+    inDegree[p.claimer] = (inDegree[p.claimer] || 0) + 1;
+  }
+
+  const flagged = new Set();
+
+  for (const p of pairs) {
+    if (edges.has(`>`)) {
       flagged.add(p.from);
       flagged.add(p.claimer);
     }
   }
+
+  for (const a of Object.keys(adj)) {
+    for (const b of (adj[a] || [])) {
+      for (const c of (adj[b] || [])) {
+        if (edges.has(`>`)) {
+          flagged.add(a);
+          flagged.add(b);
+          flagged.add(c);
+        }
+      }
+    }
+  }
+
+  for (const node of Object.keys(outDegree)) {
+    if (outDegree[node] >= 5 && inDegree[node] >= 5) {
+      flagged.add(node);
+    }
+  }
+
   return [...flagged].sort();
 }
 
@@ -80,7 +125,7 @@ async function setFrozen(admin, who) {
 (async () => {
   const pairs = await readPairs();
   console.log(`read ${pairs.length} claimed-vouch pair(s) in the window`);
-  const flagged = detectReciprocalRings(pairs);
+  const flagged = detectAbuse(pairs);
   if (!flagged.length) { console.log('no reciprocal rings detected ✅'); return; }
   console.log(`flagged ${flagged.length} ring member(s):`);
   flagged.forEach((a) => console.log('  ' + a));
@@ -91,3 +136,4 @@ async function setFrozen(admin, who) {
   for (const who of flagged) { console.log(`freezing ${who} …`); console.log('  tx ' + (await setFrozen(admin, who))); }
   console.log('done ✅');
 })().catch((e) => { console.error('FAILED ❌', e.message); process.exit(1); });
+
